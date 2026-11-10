@@ -21,6 +21,19 @@ test("remote play sends a window of the queue from the chosen song", async () =>
   await assert.rejects(plugin.remotePlay({ ids, start: 1, position: 0 }), { code: "unavailable" });
 });
 
+test("play on a list headed by the quota note starts at its first song", async () => {
+  let body;
+  const { plugin } = await setup((call) => {
+    if (call.method === "GET") return playing("a");
+    body = JSON.parse(call.body);
+    return empty();
+  }, { saved: signedIn() });
+  await plugin.remotePlay({ ids: ["missing:quota", "a", "b"], start: 0 });
+  assert.deepEqual(body.uris, ["spotify:track:a", "spotify:track:b"]);
+  // The note alone is still nothing to play.
+  await assert.rejects(plugin.remotePlay({ ids: ["missing:quota"] }), /can't play this song/);
+});
+
 test("with no active device, play goes to an open Spotify app, or says to open one", async () => {
   for (const devices of [[{ id: "restricted", is_restricted: true }, { id: "phone", name: "Phone", is_active: false }], []]) {
     const plays = [];

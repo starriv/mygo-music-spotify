@@ -8,6 +8,8 @@
   "permissions": {
     "network": [
       "accounts.spotify.com",
+      "spclient.wg.spotify.com",
+      "i.scdn.co",
       "api.spotify.com",
       "lrclib.net",
       "music.163.com"
@@ -25,6 +27,11 @@
       "label": "Client ID",
       "help": "Create an app in the Spotify Developer Dashboard with the Web API, add http://127.0.0.1:43821/callback as its redirect URI, then paste its Client ID here.",
       "link": "https://developer.spotify.com/dashboard"
+    },
+    {
+      "key": "market",
+      "label": "Chart country",
+      "help": "Optional. Two-letter country code, such as JP, US or HK, for the popular songs on an artist's page. Empty shows the charts of the country your account is in."
     },
     {
       "key": "soloistKey",
@@ -54,6 +61,16 @@
     {
       "title": "Albums",
       "builtin": "savedAlbums"
+    },
+    {
+      "title": "Playlists",
+      "page": "playlists",
+      "icon": "playlist"
+    },
+    {
+      "title": "Following",
+      "page": "following",
+      "icon": "artist"
     },
     {
       "title": "Podcasts",

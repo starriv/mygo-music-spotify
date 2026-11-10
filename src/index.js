@@ -49,6 +49,33 @@ let searchCursors; // undefined until read: shown counts to Spotify's offsets
 
 const t = (text) => host.t(text);
 
+// A Development Mode app's quota is small, and Spotify keeps one per endpoint:
+// when it is spent, one kind of read is refused for hours while the rest still
+// answer. So a page names it only when one of its own reads met it, with the
+// wait Spotify gave in Retry-After, rather than the passing refusal any request
+// here can get.
+const isQuota = (error) => error?.code === "quota";
+function quotaBack(error) {
+  const seconds = Number(error?.retryAfter);
+  if (!Number.isFinite(seconds) || seconds <= 0) return t("It comes back on its own.");
+  if (seconds >= 3600) return t("It comes back in about {hours} h.").replace("{hours}", String(Math.ceil(seconds / 3600)));
+  return t("It comes back in about {minutes} min.").replace("{minutes}", String(Math.max(1, Math.ceil(seconds / 60))));
+}
+const quotaHead = () => t("Spotify's quota for your app is spent.");
+// What a page that loaded without some of its parts says about them.
+const quotaText = (error) => `${quotaHead()} ${t("Part of this page is missing.")} ${quotaBack(error)} ${t("Each app in the Spotify Developer Dashboard has a quota of its own.")}`;
+// What a page that couldn't load at all says.
+const quotaError = (error) => `${quotaHead()} ${quotaBack(error)} ${t("Each app in the Spotify Developer Dashboard has a quota of its own.")}`;
+// A page with no description of its own says it in a grey row at the top of
+// its songs, one the app can't play.
+const QUOTA_ROW = "missing:quota";
+const quotaRow = (error) => ({
+  id: QUOTA_ROW, name: quotaHead(),
+  artists: [{ id: "", name: `${t("Part of this page is missing.")} ${quotaBack(error)}` }],
+  album: { id: "", name: "" }, duration: 0, unavailable: true,
+});
+const firstQuota = (results) => results.map((result) => result?.error ?? result).find(isQuota) || null;
+
 function fail(code, message) {
   const error = new Error(message);
   if (code) error.code = code;
@@ -291,7 +318,7 @@ function accessToken(active) {
   return refresh(active);
 }
 
-function apiError(status, body) {
+function apiError(status, body, retryAfter) {
   const detail = body?.error || {};
   const reason = detail.reason || "";
   const message = typeof detail.message === "string" ? detail.message : "";
@@ -300,6 +327,10 @@ function apiError(status, body) {
     error = fail("unavailable", t("Controlling playback needs Spotify Premium."));
   } else if (status === 403 && /not registered|not been registered|user may not be registered/i.test(message)) {
     error = fail("setup", t("This Spotify account isn't allowed to use your app. Add it under User Management in the Spotify Developer Dashboard."));
+  } else if (status === 429 && /QUOTA_EXCEEDED/i.test(reason)) {
+    error = fail("quota", "");
+    error.retryAfter = retryAfter;
+    error.message = quotaError(error);
   } else if (status === 429) {
     error = fail("", t("Spotify is limiting requests. Wait a moment and try again."));
   } else if (status === 404) {
@@ -356,7 +387,8 @@ async function api(method, path, { query, body, attempt = 0, deadline } = {}) {
     if (generation !== epoch) throw changed();
     return api(method, path, { query, body, attempt: 1, deadline });
   }
-  if (response.status === 429 && attempt === 0) {
+  // A spent quota is hours away, whatever Retry-After says: no use waiting.
+  if (response.status === 429 && attempt === 0 && !/QUOTA_EXCEEDED/i.test(data?.error?.reason || "")) {
     const wait = Number(response.headers.get("retry-after"));
     if (Number.isFinite(wait) && wait >= 0 && wait <= 5) {
       await sleep(Math.max(wait, 1) * 1000);
@@ -364,7 +396,7 @@ async function api(method, path, { query, body, attempt = 0, deadline } = {}) {
       return api(method, path, { query, body, attempt: 1, deadline });
     }
   }
-  throw apiError(response.status, data);
+  throw apiError(response.status, data, Number(response.headers.get("retry-after")));
 }
 
 // more follows the `next` links of a page Spotify gave, adding their items
@@ -660,6 +692,7 @@ export function signOut() {
   // The listener can remove the app's access at spotify.com/account/apps.
   clearSession();
   forgetLocal();
+  forgetPlayer();
   // A built-in player chosen for this account isn't chosen for the next one.
   host.storage.remove("device");
 }
@@ -705,6 +738,23 @@ async function topArtists(range, limit) {
   return (data?.items || []).filter(Boolean).map(toArtist);
 }
 
+// The artists the listener follows. Spotify pages them by cursor, under
+// `artists`, so they are read here rather than by collect.
+async function followedArtists(max = 1000) {
+  const items = [];
+  let next = null;
+  let data = await api("GET", "/me/following", { query: { type: "artist", limit: PAGE } });
+  while (data) {
+    const page = data.artists || {};
+    const added = (page.items || []).filter(Boolean);
+    items.push(...added);
+    next = page.next;
+    if (!next || !added.length || items.length >= max) break;
+    data = await api("GET", next);
+  }
+  return items.slice(0, max).map((artist) => ({ ...toArtist(artist), following: true }));
+}
+
 // settled runs optional sections side by side. One that fails says so in its
 // section, unless the listener has to sign in or set the plugin up.
 async function settled(tasks) {
@@ -740,23 +790,39 @@ export async function home() {
         empty: emptyOr(artistsResult, t("Spotify needs more listening to pick your top artists.")),
       },
       {
-        title: t("Your playlists"), playlists: (listsResult.value || []).slice(0, 20),
+        title: t("Your playlists"), playlists: (listsResult.value || []).slice(0, 20), morePage: "playlists",
         empty: emptyOr(listsResult, t("You have no playlists yet.")),
       },
     ],
   };
 }
 
+// The pages this plugin makes up show their description under the title, so
+// that is where a spent quota is said, when one of the page's own reads met
+// it. Home has no such line of its own (the app heads it instead): there a
+// section the quota emptied says so in its empty text.
+const quotaLine = (results) => {
+  const error = firstQuota(results);
+  return error ? { description: quotaText(error) } : {};
+};
+
 export async function browse({ page }) {
   if (page === "recent") {
-    return { title: t("Recently played"), sections: [{ tracks: await recentTracks(), empty: t("Play something in Spotify and it shows here.") }] };
+    const [recentResult] = await settled([recentTracks()]);
+    return {
+      title: t("Recently played"), ...quotaLine([recentResult]),
+      sections: [{
+        tracks: recentResult.value || [],
+        empty: emptyOr(recentResult, t("Play something in Spotify and it shows here.")),
+      }],
+    };
   }
   if (page === "top") {
     const [month, halfYear, artists] = await settled([
       topTracks("short_term", 50), topTracks("medium_term", 50), topArtists("medium_term", 50),
     ]);
     return {
-      title: t("Top tracks"),
+      title: t("Top tracks"), ...quotaLine([month, halfYear, artists]),
       sections: [
         { title: t("Last 4 weeks"), tracks: month.value || [], empty: emptyOr(month, t("Not enough listening yet.")) },
         { title: t("Last 6 months"), tracks: halfYear.value || [], empty: emptyOr(halfYear, t("Not enough listening yet.")) },
@@ -765,11 +831,42 @@ export async function browse({ page }) {
     };
   }
   if (page === "me") {
-    const profileResult = await profile();
-    const lists = await playlists();
+    const [profileResult, listsResult] = await settled([profile(), playlists()]);
+    const lists = listsResult.value || [];
     return {
-      title: profileResult.name, imageUrl: profileResult.imageUrl,
-      sections: [{ title: t("Your playlists"), playlists: lists.filter((item) => item.mine), empty: t("You have no playlists yet.") }],
+      title: profileResult.value?.name || "", imageUrl: profileResult.value?.imageUrl, ...quotaLine([profileResult, listsResult]),
+      sections: [{
+        title: t("Your playlists"), playlists: lists.filter((item) => item.mine),
+        empty: emptyOr(listsResult, t("You have no playlists yet.")),
+      }],
+    };
+  }
+  if (page === "playlists") {
+    const [listsResult] = await settled([playlists()]);
+    const lists = listsResult.value || [];
+    const theirs = lists.filter((item) => !item.mine);
+    return {
+      title: t("Playlists"), ...quotaLine([listsResult]),
+      sections: [
+        {
+          title: t("Created by you"), playlists: lists.filter((item) => item.mine),
+          empty: emptyOr(listsResult, t("You have no playlists yet.")),
+        },
+        // Only worth a heading when there are some, or when it failed.
+        ...(theirs.length || listsResult.error
+          ? [{ title: t("Saved playlists"), playlists: theirs, empty: emptyOr(listsResult, "") }]
+          : []),
+      ],
+    };
+  }
+  if (page === "following") {
+    const [artistsResult] = await settled([followedArtists()]);
+    return {
+      title: t("Following"), ...quotaLine([artistsResult]),
+      sections: [{
+        artists: artistsResult.value || [],
+        empty: emptyOr(artistsResult, t("Artists you follow in Spotify show here.")),
+      }],
     };
   }
   throw fail("unsupported", t("There's no such page."));
@@ -863,6 +960,650 @@ export async function search({ query, kind = "tracks", offset = 0 }) {
   return { [kind]: results, more: !!page.next && items.length > 0 };
 }
 
+// --- Playlist songs as Spotify's own player reads them -------------------
+//
+// The Web API answers a Development Mode app with a playlist's cover, name
+// and length when the listener doesn't own it, and leaves the songs out. The
+// identity Spotify's own clients sign in with reads them anyway, so such a
+// playlist is read from spclient instead: its rows from /playlist/v2, and the
+// songs in those rows from /extended-metadata, five hundred at a time. That
+// identity is a second browser approval, so it is asked for when a playlist
+// first needs it, never at sign-in.
+
+const PLAYER = "player";
+const PLAYER_CLIENT_ID = "65b708073fc0480ea92a077233ca87bd";
+const PLAYER_PORT = 8898; // the port Spotify's own player answers on
+const PLAYER_PATH = "/login";
+const PLAYER_REDIRECT = `http://127.0.0.1:${PLAYER_PORT}${PLAYER_PATH}`;
+const PLAYER_SCOPE = "streaming";
+const SPCLIENT = "https://spclient.wg.spotify.com";
+const ROWS_PAGE = 200; // spclient truncates a longer range of rows
+const METADATA_BATCH = 500; // songs per /extended-metadata request
+// The kinds Spotify's own clients ask /extended-metadata for.
+const ARTIST_V4 = 8;
+const ALBUM_V4 = 9;
+const TRACK_V4 = 10;
+const SPCLIENT_PARALLEL = 4; // requests in flight at once
+const TRACK_TTL = 30 * 60 * 1000;
+const TRACK_CACHE_MAX = 4000;
+const ROWS_TTL = 5 * 60 * 1000;
+
+let player; // undefined until read; null when never approved
+let playerTokenRefresh = null;
+let playerPending = null;
+let playerRefused = false; // this run only: never open a second browser window
+const trackCache = new Map(); // track URI to { track, at }
+const rowsCache = new Map(); // playlist ID to { uris, total, at }
+
+function currentPlayer() {
+  if (player === undefined) player = host.storage.get(PLAYER) || null;
+  return player;
+}
+
+function persistPlayer() {
+  if (player) host.storage.set(PLAYER, player);
+  else host.storage.remove(PLAYER);
+}
+
+function forgetPlayer() {
+  player = null;
+  playerTokenRefresh = null;
+  playerPending = null;
+  rowsCache.clear();
+  trackCache.clear();
+  persistPlayer();
+}
+
+// One more browser approval, for the identity Spotify's own clients use. A
+// listener who closes the page keeps a plugin that works as it did before.
+// prompt says what the approval is for.
+async function playerSignIn(prompt) {
+  if (playerPending) {
+    host.signInPrompt({ text: t("Finish signing in to Spotify in your browser…") });
+    host.openURL(playerPending.url);
+    return playerPending.promise;
+  }
+  const verifier = randomString(64);
+  const state = randomString(24);
+  const url = `${ACCOUNTS}/authorize?${new URLSearchParams({
+    client_id: PLAYER_CLIENT_ID, response_type: "code", redirect_uri: PLAYER_REDIRECT,
+    code_challenge_method: "S256", code_challenge: codeChallenge(verifier),
+    state, scope: PLAYER_SCOPE,
+  })}`;
+  const entry = { url };
+  entry.promise = (async () => {
+    // Listen before the browser opens, so the redirect can't arrive first.
+    const redirect = host.waitForRedirect({
+      port: PLAYER_PORT, path: PLAYER_PATH, timeout: 180000,
+      page: t("Signed in to Spotify. You can close this page and go back to MyGo Music."),
+    });
+    host.signInPrompt({ text: prompt || t("Reading this playlist's songs needs one more Spotify approval. Close the page to skip.") });
+    host.openURL(url);
+    const query = await redirect;
+    if (query?.error || !query?.code || query.state !== state) {
+      throw fail("", t("That approval didn't come back from this request."));
+    }
+    const body = await tokenRequest({
+      grant_type: "authorization_code", code: query.code, redirect_uri: PLAYER_REDIRECT,
+      client_id: PLAYER_CLIENT_ID, code_verifier: verifier,
+    });
+    if (!body.refresh_token) throw fail("", t("Spotify didn't return a lasting approval."));
+    player = { accessToken: body.access_token, refreshToken: body.refresh_token,
+      expiresAt: Date.now() + Number(body.expires_in || 3600) * 1000 };
+    // The approval has to be for the account the app is signed in as: another
+    // one would answer with that account's playlists. Only its own account can
+    // read its rootlist, which is the one question this token can answer.
+    try {
+      const account = await profile();
+      await spclient("GET", `/playlist/v2/user/${account.id}/rootlist?from=0&length=0`);
+    } catch (error) {
+      player = null;
+      persistPlayer();
+      if (error?.status === 403) throw fail("", t("That approval was for a different Spotify account. Approve the one you're signed in as."));
+      throw error;
+    }
+    persistPlayer();
+    return player;
+  })();
+  playerPending = entry;
+  const done = () => { if (playerPending === entry) playerPending = null; };
+  entry.promise.then(done, done);
+  return entry.promise;
+}
+
+function playerToken(prompt) {
+  const active = currentPlayer();
+  if (!active) return playerSignIn(prompt).then((value) => value.accessToken);
+  if (active.accessToken && Date.now() < active.expiresAt - REFRESH_MARGIN) return Promise.resolve(active.accessToken);
+  if (playerTokenRefresh) return playerTokenRefresh;
+  const promise = (async () => {
+    try {
+      const body = await tokenRequest({
+        grant_type: "refresh_token", refresh_token: active.refreshToken, client_id: PLAYER_CLIENT_ID,
+      });
+      acceptTokens(active, body);
+      persistPlayer();
+      return active.accessToken;
+    } catch (error) {
+      // Spotify revoked the approval. Keeping it would fail the same way on
+      // every page and never ask again: forget it, so the next page that
+      // needs it asks for a new one.
+      // It isn't the app's own sign-in that ended, so it mustn't read as one.
+      if (error?.code === "signIn") {
+        if (player === active) forgetPlayer();
+        throw fail("playerRevoked", t("Spotify withdrew the extra approval. The next page that needs it asks again."));
+      }
+      throw error;
+    }
+  })();
+  const release = () => { if (playerTokenRefresh === promise) playerTokenRefresh = null; };
+  playerTokenRefresh = promise;
+  promise.then(release, release);
+  return promise;
+}
+
+// --- Protobuf, as much of it as these answers need ----------------------
+
+function pbVarint(value) {
+  const bytes = [];
+  let left = value;
+  while (left > 0x7f) {
+    bytes.push((left & 0x7f) | 0x80);
+    left = Math.floor(left / 128);
+  }
+  bytes.push(left);
+  return Uint8Array.from(bytes);
+}
+
+function pbJoin(parts) {
+  let length = 0;
+  for (const part of parts) length += part.length;
+  const bytes = new Uint8Array(length);
+  let at = 0;
+  for (const part of parts) {
+    bytes.set(part, at);
+    at += part.length;
+  }
+  return bytes;
+}
+
+const pbTag = (number, wire) => pbVarint(number * 8 + wire);
+const pbBytes = (number, value) => pbJoin([pbTag(number, 2), pbVarint(value.length), value]);
+const pbString = (number, value) => pbBytes(number, utf8Bytes(value));
+const pbInt = (number, value) => pbJoin([pbTag(number, 0), pbVarint(value)]);
+
+// pbRead answers the fields of one message: a number for a varint, the bytes
+// for anything longer. A length that runs past the answer is a refusal, not a
+// reason to read whatever follows.
+function pbRead(bytes) {
+  const fields = [];
+  let at = 0;
+  const readVarint = () => {
+    let value = 0;
+    let shift = 0;
+    for (;;) {
+      if (at >= bytes.length) throw fail("", t("Spotify sent something this plugin can't read."));
+      const byte = bytes[at++];
+      value += (byte & 0x7f) * 2 ** shift;
+      if (byte < 0x80) return value;
+      shift += 7;
+    }
+  };
+  while (at < bytes.length) {
+    const key = readVarint();
+    const number = Math.floor(key / 8);
+    const wire = key & 7;
+    if (wire === 0) fields.push({ n: number, value: readVarint() });
+    else if (wire === 2) {
+      const length = readVarint();
+      fields.push({ n: number, value: bytes.subarray(at, at + length) });
+      at += length;
+    } else if (wire === 5) at += 4;
+    else if (wire === 1) at += 8;
+    else throw fail("", t("Spotify sent something this plugin can't read."));
+  }
+  return fields;
+}
+
+const pbFirst = (fields, number) => fields.find((field) => field.n === number)?.value;
+const pbAll = (fields, number) => fields.filter((field) => field.n === number).map((field) => field.value);
+const decoder = new TextDecoder();
+const pbText = (value) => (value === undefined ? "" : decoder.decode(value));
+const pbSint = (value) => (value === undefined ? 0 : value % 2 ? -(value + 1) / 2 : value / 2);
+
+// Spotify writes an ID as 22 base62 digits of its 16 bytes, and hands a gid
+// back as those bytes.
+const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+function base62(bytes) {
+  if (!bytes || !bytes.length) return "";
+  const digits = [];
+  for (const byte of bytes) {
+    let carry = byte;
+    for (let i = 0; i < digits.length; i++) {
+      carry += digits[i] * 256;
+      digits[i] = carry % 62;
+      carry = Math.floor(carry / 62);
+    }
+    while (carry) {
+      digits.push(carry % 62);
+      carry = Math.floor(carry / 62);
+    }
+  }
+  return digits.reverse().map((digit) => BASE62[digit]).join("").padStart(22, "0");
+}
+
+const hexOf = (bytes) => Array.from(bytes || [], (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+// The country whose charts to read. Spotify's own clients take it from the
+// account, which the Web API no longer tells, so a listener who wants another
+// country's charts names it in the settings, and the session's own answer
+// stands when they don't.
+function market() {
+  const value = String(host.setting("market") || "").trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(value) ? value : "";
+}
+
+// The 16 bytes behind an ID's 22 base62 digits: the request that asks for
+// metadata by gid spells them in hex.
+function gidOf(id) {
+  let digits = [...String(id)].map((character) => BASE62.indexOf(character));
+  if (!digits.length || digits.some((digit) => digit < 0)) return "";
+  const bytes = [];
+  while (digits.length) {
+    let rest = 0;
+    const next = [];
+    for (const digit of digits) {
+      rest = rest * 62 + digit;
+      const value = Math.floor(rest / 256);
+      rest %= 256;
+      if (next.length || value) next.push(value);
+    }
+    bytes.push(rest);
+    digits = next;
+  }
+  while (bytes.length < 16) bytes.push(0);
+  return bytes.reverse().map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+// --- spclient requests ---------------------------------------------------
+
+// Spotify paces spclient as it paces the Web API. A few reads run at once, so
+// a long playlist doesn't open a hundred connections, and a refused one waits
+// as long as Spotify asks before giving the page a reason.
+let spclientFree = SPCLIENT_PARALLEL;
+const spclientWaiting = [];
+
+async function spclientSlot(task) {
+  if (spclientFree) spclientFree--;
+  else await new Promise((resolve) => spclientWaiting.push(resolve));
+  try {
+    return await task();
+  } finally {
+    const next = spclientWaiting.shift();
+    if (next) next();
+    else spclientFree++;
+  }
+}
+
+// prompt says what an approval asked for here is for.
+async function spclient(method, path, body, prompt) {
+  return spclientSlot(async () => {
+    for (let attempt = 0; ; attempt++) {
+      const token = await playerToken(prompt);
+      const headers = { Authorization: `Bearer ${token}` };
+      const init = { method, headers };
+      if (body) {
+        headers["Content-Type"] = "application/x-protobuf";
+        init.body = body;
+      }
+      const response = await timedFetch(`${SPCLIENT}${path}`, init);
+      if (response.ok) return new Uint8Array(await response.arrayBuffer());
+      if (response.status === 401 && attempt === 0) {
+        // The token can be revoked before it expires: refresh once.
+        const active = currentPlayer();
+        if (active) active.expiresAt = 0;
+        continue;
+      }
+      if (method === "GET" && [502, 503, 504].includes(response.status) && attempt === 0) {
+        await sleep(1000);
+        continue;
+      }
+      if (response.status === 429 && attempt === 0) {
+        const wait = Number(response.headers.get("retry-after"));
+        if (Number.isFinite(wait) && wait >= 0 && wait <= 5) {
+          await sleep(Math.max(wait, 1) * 1000);
+          continue;
+        }
+      }
+      const refused = fail("unavailable", `${t("Spotify refused the request.")} (${response.status})`);
+      refused.status = response.status;
+      throw refused;
+    }
+  });
+}
+
+const rowsPath = (id, from) =>
+  `/playlist/v2/playlist/${id}?decorate=revision,length,attributes,owner&from=${from}&length=${ROWS_PAGE}`;
+
+// The songs of a playlist in order, however long it is. A page of rows is 200
+// at most, so a longer playlist is read a page at a time.
+async function readRows(id) {
+  const cached = rowsCache.get(id);
+  if (cached && Date.now() - cached.at < ROWS_TTL) return cached;
+  const page = async (from) => {
+    const fields = pbRead(await spclient("GET", rowsPath(id, from)));
+    const contents = pbFirst(fields, 5);
+    const rows = contents ? pbRead(contents) : [];
+    const all = pbAll(rows, 3).map((item) => pbText(pbFirst(pbRead(item), 1)));
+    return {
+      total: pbFirst(fields, 2) || 0,
+      truncated: pbFirst(rows, 2) === 1,
+      seen: all.length,
+      // Local files and episodes sit in playlists beside songs, and count in
+      // its length: every row is kept, so the page matches Spotify's count.
+      uris: all.filter(Boolean),
+    };
+  };
+  const head = await page(0);
+  const uris = [...head.uris];
+  let seen = head.seen;
+  let truncated = head.truncated;
+  while (truncated && seen < PLAYLIST_LIMIT) {
+    const next = await page(seen);
+    if (!next.seen) break;
+    uris.push(...next.uris);
+    seen += next.seen;
+    truncated = next.truncated;
+  }
+  const value = { uris, total: Math.max(head.total, seen), at: Date.now() };
+  rowsCache.set(id, value);
+  return value;
+}
+
+// --- Songs, five hundred to a request ------------------------------------
+
+// /extended-metadata takes a list of songs and answers their details in one
+// answer, so a thousand-song playlist costs two requests, not a thousand.
+function trackFrom(uri, fields) {
+  const id = uri.slice("spotify:track:".length);
+  const albumField = pbFirst(fields, 3);
+  const album = albumField ? pbRead(albumField) : [];
+  const artists = pbAll(fields, 4).map((artist) => {
+    const message = pbRead(artist);
+    return { id: base62(pbFirst(message, 1)), name: pbText(pbFirst(message, 2)), imageUrl: "" };
+  });
+  const name = pbText(pbFirst(fields, 2));
+  return {
+    id, name,
+    artists,
+    album: {
+      id: base62(pbFirst(album, 1)), name: pbText(pbFirst(album, 2)),
+      imageUrl: coverOf(album), artists: [], released: "",
+    },
+    duration: Math.max(0, pbSint(pbFirst(fields, 7))),
+    url: `https://open.spotify.com/track/${id}`,
+    unavailable: !name,
+  };
+}
+
+// A song's album picture, from the size Spotify labels large: a row shows it
+// a few dozen points wide, and the largest is a few times the bytes for it.
+function coverOf(album) {
+  const group = pbFirst(album, 17);
+  const images = group
+    ? pbAll(pbRead(group), 1).map((image) => pbRead(image))
+    : pbAll(album, 9).map((image) => pbRead(image));
+  const usable = images.filter((image) => pbFirst(image, 1)?.length);
+  if (!usable.length) return "";
+  const size = (image) => pbFirst(image, 2);
+  const pick = usable.find((image) => size(image) === 2) || usable.find((image) => size(image) === 3) || usable[0];
+  return `https://i.scdn.co/image/${hexOf(pbFirst(pick, 1))}`;
+}
+
+// A local file has no metadata to ask for: its row spells out what it is.
+function localTrack(uri, index) {
+  const [artist = "", album = "", title = "", seconds = ""] = uri.split(":").slice(2);
+  const text = (value) => {
+    try { return decodeURIComponent(value).replace(/\+/g, " "); } catch { return value; }
+  };
+  return {
+    id: `local:${encodeURIComponent(uri)}`, name: text(title),
+    artists: artist ? [{ id: "", name: text(artist), imageUrl: "" }] : [],
+    album: { id: "", name: text(album), imageUrl: "", artists: [], released: "" },
+    duration: Math.max(0, Number(seconds) || 0) * 1000,
+    url: "", unavailable: true,
+  };
+}
+
+// Albums, in one request the way songs are read: an artist's album groups
+// name nothing, only their gids.
+function albumFrom(uri, fields) {
+  const id = uri.slice("spotify:album:".length);
+  return {
+    id, name: pbText(pbFirst(fields, 2)), imageUrl: coverOf(fields),
+    artists: pbAll(fields, 3).map((artist) => {
+      const message = pbRead(artist);
+      return { id: base62(pbFirst(message, 1)), name: pbText(pbFirst(message, 2)), imageUrl: "" };
+    }),
+    released: "",
+  };
+}
+
+// The messages behind a batch of uris, read the way Spotify's own clients read
+// them: one POST carries up to METADATA_BATCH uris and an extension kind, and
+// the country heads the request so the charts inside an artist answer for the
+// market in the settings. Each answer wraps the entity's own message in bytes.
+async function extendedMetadata(kind, uris, country, prompt) {
+  const request = pbJoin([
+    ...(country ? [pbBytes(1, pbString(1, country))] : []),
+    ...uris.map((uri) => pbBytes(2, pbJoin([pbString(1, uri), pbBytes(2, pbInt(1, kind))]))),
+  ]);
+  const fields = pbRead(await spclient("POST", "/extended-metadata/v0/extended-metadata", request, prompt));
+  const messages = new Map();
+  for (const array of pbAll(fields, 2)) {
+    for (const entity of pbAll(pbRead(array), 3)) {
+      const data = pbRead(entity);
+      const uri = pbText(pbFirst(data, 2));
+      const any = pbFirst(data, 3);
+      const message = any ? pbFirst(pbRead(any), 2) : undefined;
+      if (uri && message) messages.set(uri, pbRead(message));
+    }
+  }
+  return messages;
+}
+
+async function readAlbums(uris) {
+  const albums = [];
+  for (const batch of chunks(uris, METADATA_BATCH)) {
+    for (const [uri, fields] of await extendedMetadata(ALBUM_V4, batch)) albums.push(albumFrom(uri, fields));
+  }
+  return albums.filter((album) => album.name);
+}
+
+// The session's own search, over the context Spotify's clients read an artist
+// with. A Development Mode app's Web API search is a narrow index, where an
+// artist's name can miss every song of theirs; this one names them by uri
+// alone, so their details come from the batches above.
+async function sessionSearch(query) {
+  const path = `/context-resolve/v1/spotify:search:${encodeURIComponent(query).replace(/%20/g, "+")}`;
+  const body = JSON.parse(decoder.decode(await spclient("GET", path)));
+  const pages = Array.isArray(body?.pages) ? body.pages : [];
+  return pages.flatMap((page) => (page?.tracks || []).map((track) => track?.uri)).filter(Boolean);
+}
+
+// An artist's own context, as Spotify's clients read it: their most popular
+// songs and then their latest album's, named by uri alone. The rest of its
+// pages are the albums, a request each, and those are the albums section's.
+async function artistContextSongs(id) {
+  const body = JSON.parse(decoder.decode(await spclient("GET", `/context-resolve/v1/spotify:artist:${id}`)));
+  const artistUri = `spotify:artist:${id}`;
+  return (Array.isArray(body?.pages) ? body.pages : [])
+    .flatMap((page) => page?.tracks || [])
+    .filter((track) => !track?.metadata?.artist_uri || track.metadata.artist_uri === artistUri)
+    .map((track) => track?.uri)
+    .filter(Boolean);
+}
+
+// The popular songs of one country, as the artist's metadata lists them: a
+// market Spotify lists no songs for falls back to the worldwide ranking and
+// then to the longest list, the way Spotify's own table does. They are named
+// by gid, so their details come from the batch every song of the page is read
+// in.
+function chartUris(fields, country) {
+  const lists = pbAll(fields, 4).map((top) => pbRead(top)).filter((top) => pbAll(top, 2).length);
+  const countryOf = (top) => pbText(pbFirst(top, 1));
+  const longest = (a, b) => (pbAll(b, 2).length > pbAll(a, 2).length ? b : a);
+  const chosen = (country && lists.find((top) => countryOf(top) === country))
+    || lists.find((top) => countryOf(top) === "ZZ")
+    || lists.reduce(longest, lists[0]);
+  if (!chosen) return [];
+  return pbAll(chosen, 2)
+    .map((track) => `spotify:track:${base62(pbFirst(pbRead(track), 1))}`)
+    .filter((uri) => uri !== "spotify:track:");
+}
+
+async function readTracks(uris) {
+  const wanted = uris.filter((uri) => uri.startsWith("spotify:track:"));
+  const stale = new Set(wanted.filter((uri) => {
+    const cached = trackCache.get(uri);
+    return !cached || Date.now() - cached.at >= TRACK_TTL;
+  }));
+  const batches = [];
+  const batch = wanted.filter((uri) => stale.has(uri));
+  for (let i = 0; i < batch.length; i += METADATA_BATCH) batches.push(batch.slice(i, i + METADATA_BATCH));
+  await Promise.all(batches.map(async (batch) => {
+    for (const [uri, fields] of await extendedMetadata(TRACK_V4, batch)) {
+      trackCache.set(uri, { track: trackFrom(uri, fields), at: Date.now() });
+    }
+  }));
+  while (trackCache.size > TRACK_CACHE_MAX) trackCache.delete(trackCache.keys().next().value);
+  // A song Spotify keeps no details for still has its row, as the Web API's
+  // own page would show it: an empty row, not a silently shorter playlist.
+  let known = 0;
+  const tracks = uris.map((uri, index) => {
+    if (uri.startsWith("spotify:local:")) {
+      known++;
+      return localTrack(uri, index);
+    }
+    const track = trackCache.get(uri)?.track;
+    if (track) {
+      known++;
+      return track;
+    }
+    return missing("track", index);
+  });
+  return { tracks, known };
+}
+
+// The songs of a playlist the Web API withholds, or null when this listener
+// hasn't approved the player identity and won't be asked again this run.
+async function playerTracks(id, retried = false) {
+  if (playerRefused && !currentPlayer()) return null;
+  try {
+    const rows = await readRows(id);
+    if (!rows.uris.length) return null;
+    const { tracks, known } = await readTracks(rows.uris);
+    if (!known) return null;
+    // Only a playlist longer than the app shows is worth saying so about.
+    return { tracks, total: rows.total, truncated: rows.total > rows.uris.length };
+  } catch (error) {
+    // Spotify withdrew an approval it had given: ask once for a new one.
+    if (error?.code === "playerRevoked" && !retried) return playerTracks(id, true);
+    // The approval declined, timed out, or was refused: the page shows the
+    // note it showed before, and the browser stays closed from now on.
+    if (error?.code === "signIn") throw error;
+    playerRefused = true;
+    return null;
+  }
+}
+
+// A portrait, from the group of sizes Spotify keeps of it.
+function portraitOf(fields) {
+  const group = pbFirst(fields, 17);
+  const images = group ? pbAll(pbRead(group), 1).map((image) => pbRead(image)) : pbAll(fields, 11);
+  const usable = images.filter((image) => pbFirst(image, 1)?.length);
+  if (!usable.length) return "";
+  const pick = usable.find((image) => pbFirst(image, 2) === 3) || usable[0];
+  return `https://i.scdn.co/image/${hexOf(pbFirst(pick, 1))}`;
+}
+
+// The chart the settings name, from the one route that takes a country: the
+// extension Spotify's clients ask for answers for the account's own country
+// whatever it is told, and this route is what names another. Null when it
+// names no chart at all, so the artist's own answer stands in.
+async function playerChart(id, country) {
+  const fields = pbRead(await spclient("GET", `/metadata/4/artist/${gidOf(id)}?country=${country}`));
+  return pbAll(fields, 4).length ? fields : null;
+}
+
+// A whole artist page from Spotify's own metadata, which answers without the
+// Web API's quota: who they are, their portrait, their albums and singles, and
+// their songs. The chart leads, then the songs it leaves out: their own
+// context adds the latest album's, and the session's search finds the rest of
+// their most played. Requests that don't wait on each other go out together,
+// so the page arrives in as few round trips as its answers allow. Null when
+// the listener has turned the approval down this run; a page without the
+// approval asks for it once, and again when Spotify withdraws one it gave.
+async function playerArtist(id, needAlbums = true, retried = false) {
+  const country = market();
+  if (playerRefused && !currentPlayer()) return null;
+  const uri = `spotify:artist:${id}`;
+  let fields;
+  try {
+    fields = (await extendedMetadata(ARTIST_V4, [uri], country,
+      t("The popular songs on an artist's page need one more Spotify approval. Close the page to skip."))).get(uri);
+  } catch (error) {
+    if (error?.code === "playerRevoked" && !retried) return playerArtist(id, needAlbums, true);
+    // The approval declined or timed out: no browser window again this run.
+    if (!currentPlayer()) playerRefused = true;
+    throw error;
+  }
+  if (!fields) return null;
+  const name = pbText(pbFirst(fields, 2));
+  if (!name) return null;
+  // A country in the settings is asked for on its own: the answer above is
+  // the account's own charts. A page that can't get it keeps that one.
+  const charts = country ? (await playerChart(id, country).catch(() => null)) || fields : fields;
+  const chart = chartUris(charts, country);
+  const albumIds = [...pbAll(fields, 5), ...pbAll(fields, 6)]
+    .flatMap((group) => pbAll(pbRead(group), 1))
+    .map((album) => base62(pbFirst(pbRead(album), 1)))
+    .filter(Boolean);
+  // The chart's own details name the song the search leans on, so they, the
+  // context and the name go out at once.
+  const [chartRead, contextUris, namedUris] = await Promise.all([
+    chart.length ? readTracks(chart) : { tracks: [] },
+    artistContextSongs(id).catch(() => []),
+    sessionSearch(name).catch(() => []),
+  ]);
+  const songName = chartRead.tracks.find((track) => !track.unavailable)?.name;
+  const songUris = songName ? await sessionSearch(songName).catch(() => []) : [];
+  const beyond = [...new Set([...contextUris, ...namedUris, ...songUris])].filter((uri) => !chart.includes(uri));
+  const [beyondRead, albums] = await Promise.all([
+    beyond.length ? readTracks(beyond) : { tracks: [] },
+    // The Web API's albums come first; these only stand in when it had none.
+    needAlbums && albumIds.length ? readAlbums(albumIds.map((album) => `spotify:album:${album}`)) : [],
+  ]);
+  // The chart keeps its order; the rest are only songs the artist is credited
+  // on, and no title is listed twice.
+  const titles = new Set();
+  const tracks = [];
+  const rows = [
+    ...chartRead.tracks.map((track) => ({ track, own: false })),
+    ...beyondRead.tracks.map((track) => ({ track, own: true })),
+  ];
+  for (const { track, own } of rows) {
+    if (track.unavailable) continue;
+    if (own && !track.artists?.some((artist) => artist.id === id)) continue;
+    const title = String(track.name || "").toLowerCase();
+    if (!title || titles.has(title)) continue;
+    titles.add(title);
+    tracks.push(track);
+  }
+  return { artist: { id, name, imageUrl: portraitOf(fields) }, tracks, albums };
+}
+
 // --- Library ------------------------------------------------------------
 
 export async function playlists(max = 2000) {
@@ -878,14 +1619,33 @@ export async function playlist({ id }) {
   const result = toPlaylist(data, profileResult);
   const first = data.items ?? data.tracks;
   if (!first || !Array.isArray(first.items)) {
-    // Development Mode apps can read the songs of only the listener's own
-    // and collaborative playlists.
+    // Spotify withholds the songs of a playlist the listener doesn't own.
+    // The player identity reads them, so ask it before explaining the gap.
+    const read = await playerTracks(id);
+    if (read) {
+      result.tracks = read.tracks;
+      result.trackCount = Math.max(result.trackCount, read.total);
+      if (read.truncated) {
+        result.description += `${result.description ? "\n" : ""}${t("Showing the first 1000 songs.")}`;
+      }
+      return result;
+    }
     result.tracks = [];
     const note = t("Spotify lets this plugin list the songs of only your own and collaborative playlists. Open this one in the Spotify app to play it.");
     result.description = result.description ? `${result.description}\n${note}` : note;
     return result;
   }
-  const entries = await more([...first.items], first, PLAYLIST_LIMIT);
+  // A page Spotify can't finish is still worth what it has, with the reason
+  // in its description rather than an empty page and a Retry.
+  let entries = [...first.items];
+  let spent = null;
+  try {
+    entries = await more(entries, first, PLAYLIST_LIMIT);
+  } catch (error) {
+    if (!isQuota(error)) throw error;
+    spent = error;
+  }
+  if (spent) result.description += `${result.description ? "\n" : ""}${quotaText(spent)}`;
   result.tracks = entries.map((entry, index) => toTrack(entry?.item ?? entry?.track, undefined, index));
   if (result.trackCount > PLAYLIST_LIMIT) {
     result.description += `${result.description ? "\n" : ""}${t("Showing the first 1000 songs.")}`;
@@ -1030,6 +1790,22 @@ async function artistAlbums(id) {
   }
 }
 
+// An artist page reads the artist and their albums over the Web API, and
+// searches it for their songs when the session can't name them. A Development
+// Mode app's quota is small, and Spotify turning one of these down for a
+// moment shouldn't cost the listener the whole page, so a section it limits
+// stays empty and the page shows the rest. A spent quota is handed to noted,
+// so the page can say why the section is empty.
+async function unlessLimited(task, fallback, noted) {
+  try {
+    return await task();
+  } catch (error) {
+    if (error.status !== 429) throw error;
+    if (isQuota(error)) noted?.(error);
+    return fallback;
+  }
+}
+
 // Development Mode apps can't read an artist's top tracks, so the page lists
 // the artist's songs that search finds first, by Spotify's relevance.
 async function artistTracks(artistResult) {
@@ -1048,12 +1824,39 @@ async function artistTracks(artistResult) {
 
 export async function artist({ id }) {
   id = idOf(id);
+  let limited = null;
+  let albumsSpent = null;
+  let tracksSpent = null;
   const [data, albums, following] = await Promise.all([
-    api("GET", `/artists/${id}`), artistAlbums(id), savedFlag(`spotify:artist:${id}`),
+    api("GET", `/artists/${id}`).catch((error) => {
+      // A Development Mode app's quota runs out as a 429, and the session can
+      // still answer the page, so it is kept for the fallback below.
+      if (error?.status !== 429) throw error;
+      limited = error;
+      return null;
+    }),
+    unlessLimited(() => artistAlbums(id), [], (error) => { albumsSpent = error; }),
+    savedFlag(`spotify:artist:${id}`),
   ]);
-  if (!data) throw fail("unavailable", t("This artist isn't available."));
-  const result = { ...toArtist(data), following };
-  return { artist: result, tracks: await artistTracks(result), albums: albums.filter(Boolean).map(toAlbum) };
+  // The session's charts are what the page is for, and its albums stand in
+  // for any the Web API had no quota left to answer. It is the whole page when
+  // the Web API answered nothing at all. Without the approval it needs,
+  // playerArtist asks for it once; turned down, the page falls back to search.
+  const played = await playerArtist(id, !albums.length).catch(() => null);
+  if (!data && !played) throw limited || fail("unavailable", t("This artist isn't available."));
+  const result = data ? { ...toArtist(data), following } : { ...played.artist, following: false };
+  // The session's own page carries the artist's songs, their charts first. A
+  // page without the approval it needs falls back to the Web API's search.
+  const tracks = played?.tracks?.length
+    ? played.tracks
+    : await unlessLimited(() => artistTracks(result), [], (error) => { tracksSpent = error; });
+  const albumList = albums.length ? albums.filter(Boolean).map(toAlbum) : played?.albums || [];
+  // A section the quota left empty, with nothing standing in for it.
+  const spent = (!tracks.length && tracksSpent) || (!albumList.length && albumsSpent) || null;
+  // The page has no line of text of its own, so the reason heads its songs:
+  // a page with nothing else on it says why, instead of claiming the artist
+  // has nothing.
+  return { artist: result, tracks: spent ? [quotaRow(spent), ...tracks] : tracks, albums: albumList };
 }
 
 export async function followArtist({ id, on }) {
@@ -1711,6 +2514,9 @@ async function confirmPlaying(uris, deadline = Infinity, device = "") {
 
 export async function remotePlay({ ids, start = 0, position = 0 }) {
   if (!Array.isArray(ids) || !ids.length) throw fail("unavailable", t("There's nothing to play."));
+  // The note heading an artist page the quota emptied isn't a song: Play on
+  // that page starts at the first song after it.
+  while (start < ids.length - 1 && ids[start] === QUOTA_ROW) start++;
   const first = uriOf(ids[start] ?? "");
   if (!first) throw fail("unavailable", t("Spotify can't play this song."));
   const uris = [];

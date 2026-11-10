@@ -19,6 +19,14 @@ export const json = (body, status = 200, headers = {}) => ({
 
 export const empty = (status = 204) => json(undefined, status);
 
+// A binary answer, for the protobuf spclient sends.
+export const bytes = (body, status = 200) => ({
+  ok: status >= 200 && status < 300, status,
+  arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+  headers: { get: () => null },
+  text: async () => "",
+});
+
 export const signedIn = (extra = {}) => ({
   clientId: CLIENT, accessToken: "synthetic-access", refreshToken: "synthetic-refresh",
   expiresAt: Date.now() + 3600000, ...extra,
